@@ -1,5 +1,10 @@
 # particles  
-*A nature-inspired generative algorithm for the **disting NT** ✨*  
+
+![particles](/assets/img/particles.png)
+
+*Embracing the impermanent nature and uninterrupted everchanging flow of life.*
+
+A nature-inspired generative algorithm for the **disting NT** ✨
 
 ![version](https://img.shields.io/badge/version-v0.1-blue) ![status](https://img.shields.io/badge/status-beta-orange)  
 
