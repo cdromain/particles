@@ -1,4 +1,4 @@
--- particles generative algorithm, inspired by the fall script for norns
+-- particles generative algorithm for the disting NT, inspired by the fall script for norns
 -- Romain Faure, 2025 - with inspiration & support from thorinside & the disting community
 
 -- Set a fixed random seed for reproducibility & debugging, or leave as nil for default randomness
@@ -7,10 +7,39 @@ if seed then
     math.randomseed(seed) -- Initialize the random number generator only if a seed is provided
 end
 
+-- ============ OPTIMIZATION: OBJECT POOLS ============
+local MAX_PARTICLES = 12
+local MAX_DUST = 50
+local particle_pool = {}
+local dust_pool = {}
+local active_particles = 0
+local active_dust = 0
+
+-- Pre-create all particles in the pool
+for i = 1, MAX_PARTICLES do
+    particle_pool[i] = {
+        x = 0, y = 0, base_speed = 0, sway = 0,
+        sway_speed = 0, wind_sensitivity = 0,
+        radius = 0, pitch = 0, last_collision_time = 0,
+        active = false, index = i
+    }
+end
+
+-- Pre-create all dust in the pool
+for i = 1, MAX_DUST do
+    dust_pool[i] = {
+        x = 0, y = 0, dx = 0, dy = 0,
+        brightness = 0, life = 0,
+        active = false, index = i
+    }
+end
+
 local time = 0
-local particles = {} -- Falling particles triggering musical events
-local dust = {}      -- Background dust specks (visual eye-candy)
+local output_table = {0, 0, 0, 0} -- Pre-allocated output table
+local particles = particle_pool -- Falling particles triggering musical events
+local dust = dust_pool -- Background dust specks (visual eye-candy)
 local ground_level = 64 -- Y‑coordinate threshold for particles touching the ground
+local last_ground_pitch_voltage = 0  -- Voltage of last particle that hit ground
 local collision_cooldown_time = 3 -- Minimum time between collision events (in seconds)
 local trigger_timer = 0 -- Timer for resetting particle trigger output
 local trigger_duration = 0.05 -- Trigger duration in seconds
@@ -43,6 +72,8 @@ local scales = {
     harmonic_minor = {0, 2, 3, 5, 7, 8, 11},
     melodic_minor = {0, 2, 3, 5, 7, 9, 11}
 }
+local scale_names = {"minor", "major", "dorian", "phrygian", "lydian", "mixolydian", 
+                            "locrian", "harmonic_minor", "melodic_minor"}
 
 -- Map MIDI note to voltage
 local function note_to_voltage(note)
@@ -58,129 +89,167 @@ local function scale_to_midi(scale_degree, scale_type, root, oct)
     return (oct * 12) + root + note_in_scale
 end
 
--- Create a new particle
-local function create_particle()
-    local size = math.random(3, 10) -- particle size
-    local speed_factor = (1.5 * size + 3) / 10 * gravity
-    return {
-        x = math.random(0, 255), -- X position within screen width
-        y = 0, -- Start at the top of the screen
-        base_speed = speed_factor,
-        sway = math.random() * 2 * math.pi,
-        sway_speed = math.random(1, 3) / 10,
-        wind_sensitivity = 0.7 + 0.3 / size,
-        radius = size,
-        pitch = math.random(1, #scales[selected_scale]),
-        last_collision_time = -collision_cooldown_time -- Initialize to allow immediate collision
-    }
+-- Get an inactive particle from the pool
+local function get_particle()
+    for i = 1, MAX_PARTICLES do
+        if not particle_pool[i].active then
+            return particle_pool[i]
+        end
+    end
+    return nil
 end
 
--- Create a new dust speck
-local function create_dust()
-    return {
-        x = math.random(0, 255),
-        y = math.random(0, 63),
-        dx = (math.random() - 0.5) * wind,
-        dy = (math.random() - 0.5) * 5,
-        brightness = math.random(1, 5),
-        life = math.random(3, 10)
-    }
+-- Activate a particle with new values
+local function activate_particle(p)
+    local size = math.random(3, 10) -- particle size
+    local speed_factor = (1.5 * size + 3) / 10 * gravity
+    
+    p.x = math.random(0, 255) -- X position within screen width
+    p.y = 0 -- Start at the top of the screen
+    p.base_speed = speed_factor
+    p.sway = math.random() * 2 * math.pi
+    p.sway_speed = math.random(1, 3) / 10
+    p.wind_sensitivity = 0.7 + 0.3 / size
+    p.radius = size
+    p.pitch = math.random(1, #scales[selected_scale])
+    p.last_collision_time = time - collision_cooldown_time -- Initialize to allow immediate collision
+    p.active = true
+    active_particles = active_particles + 1
+end
+
+-- Deactivate a particle
+local function deactivate_particle(p)
+    p.active = false
+    active_particles = active_particles - 1
+end
+
+-- Get an inactive dust from the pool
+local function get_dust()
+    for i = 1, MAX_DUST do
+        if not dust_pool[i].active then
+            return dust_pool[i]
+        end
+    end
+    return nil
+end
+
+-- Activate a dust speck with new values
+local function activate_dust(d)
+    d.x = math.random(0, 255)
+    d.y = math.random(0, 63)
+    d.dx = (math.random() - 0.5) * wind
+    d.dy = (math.random() - 0.5) * 5
+    d.brightness = math.random(1, 5)
+    d.life = math.random(3, 10)
+    d.active = true
+    active_dust = active_dust + 1
+end
+
+-- Deactivate a dust speck
+local function deactivate_dust(d)
+    d.active = false
+    active_dust = active_dust - 1
 end
 
 -- Update falling particles
 local function update_particles(dt)
-    for i = #particles, 1, -1 do
+    for i = 1, MAX_PARTICLES do
         local p = particles[i]
-        p.y = p.y + p.base_speed * global_fall_speed * dt
-        p.sway = p.sway + p.sway_speed * dt
-        p.x = p.x + math.sin(p.sway) * wind * p.wind_sensitivity
+        if p.active then
+            p.y = p.y + p.base_speed * global_fall_speed * dt
+            p.sway = p.sway + p.sway_speed * dt
+            p.x = p.x + math.sin(p.sway) * wind * p.wind_sensitivity
 
-        -- Handle borders
-        if p.x < 0 then
-            p.x = 0
-            p.sway = p.sway + math.pi / 4
-        elseif p.x > 255 then
-            p.x = 255
-            p.sway = p.sway - math.pi / 4
-        end
+            -- Handle borders
+            if p.x < 0 then
+                p.x = 0
+                p.sway = p.sway + math.pi / 4
+            elseif p.x > 255 then
+                p.x = 255
+                p.sway = p.sway - math.pi / 4
+            end
 
-        -- Handle ground collision
-        if p.y >= ground_level then
-            -- Calculate the actual MIDI note using the scale degree
-            local midi_note = scale_to_midi(p.pitch, selected_scale, root_note, octave)
-            local pitch_voltage = note_to_voltage(midi_note)
-            verbose_message = string.format("Particle CV: %.2fV, Trigger: 5V", pitch_voltage)
-            verbose_timer = verbose_duration
-            trigger_timer = trigger_duration -- Activate particle trigger
-            table.remove(particles, i)
+            -- Handle ground collision
+            if p.y >= ground_level then
+                -- Calculate the actual MIDI note using the scale degree
+                local midi_note = scale_to_midi(p.pitch, selected_scale, root_note, octave)
+                local pitch_voltage = note_to_voltage(midi_note)
+                last_ground_pitch_voltage = pitch_voltage 
+                verbose_message = string.format("Particle CV: %.2fV, Trigger: 5V", pitch_voltage)
+                verbose_timer = verbose_duration
+                trigger_timer = trigger_duration -- Activate particle trigger
+                deactivate_particle(p)
+            end
         end
     end
 
-    if #particles < max_particles and math.random() > 0.8 then
-        table.insert(particles, create_particle())
+    -- Spawn new particles if needed
+    if active_particles < max_particles and math.random() > 0.8 then
+        local p = get_particle()
+        if p then
+            activate_particle(p)
+        end
     end
 end
 
 -- Update dust specks
 local function update_dust(dt)
-    for i = #dust, 1, -1 do
+    for i = 1, MAX_DUST do
         local d = dust[i]
-        d.x = d.x + d.dx * dt
-        d.y = d.y + d.dy * dt
-        d.life = d.life - dt
+        if d.active then
+            d.x = d.x + d.dx * dt
+            d.y = d.y + d.dy * dt
+            d.life = d.life - dt
 
-        -- Remove expired dust specks
-        if d.life <= 0 then
-            table.remove(dust, i)
+            -- Deactivate expired dust
+            if d.life <= 0 then
+                deactivate_dust(d)
+            end
         end
     end
 
-    while #dust < max_dust do
-        table.insert(dust, create_dust())
+    -- Spawn new dust if needed
+    while active_dust < max_dust do
+        local d = get_dust()
+        if d then
+            activate_dust(d)
+        else
+            break
+        end
     end
 end
 
 -- Check for collisions between particles
 local function check_collisions(dt)
-    for i = 1, #particles do
-        for j = i + 1, #particles do
-            local p1 = particles[i]
-            local p2 = particles[j]
+    for i = 1, MAX_PARTICLES do
+        local p1 = particles[i]
+        if p1.active then
+            for j = i + 1, MAX_PARTICLES do
+                local p2 = particles[j]
+                if p2.active then
 
-            -- Box-based collision detection
-            local box1 = {
-                left = p1.x,
-                right = p1.x + p1.radius,
-                top = p1.y,
-                bottom = p1.y + p1.radius
-            }
-            local box2 = {
-                left = p2.x,
-                right = p2.x + p2.radius,
-                top = p2.y,
-                bottom = p2.y + p2.radius
-            }
+                    -- Box-based collision detection (overlap)
+                    if p1.x < p2.x + p2.radius and
+                       p1.x + p1.radius > p2.x and
+                       p1.y < p2.y + p2.radius and
+                       p1.y + p1.radius > p2.y then
+                        
+                        -- Check if enough time has passed since the last collision for either particle (cooldown)
+                        local current_time = time
+                        if current_time - p1.last_collision_time >= collision_cooldown_time and 
+                           current_time - p2.last_collision_time >= collision_cooldown_time then
 
-            -- Check if boxes overlap
-            if box1.left < box2.right and
-               box1.right > box2.left and
-               box1.top < box2.bottom and
-               box1.bottom > box2.top then
-                
-                -- Check if enough time has passed since the last collision for either particle
-                local current_time = time
-                if current_time - p1.last_collision_time >= collision_cooldown_time and 
-                   current_time - p2.last_collision_time >= collision_cooldown_time then
+                            -- Collision detected
+                            collision_cv = math.random(-50, 50) / 10
+                            verbose_message = string.format("Collision CV: %.2fV, Trigger: 5V", collision_cv)
+                            verbose_timer = verbose_duration
+                            collision_trigger_timer = trigger_duration
 
-                    -- Collision detected
-                    collision_cv = math.random(-50, 50) / 10 -- Random CV between -5V and +5V
-                    verbose_message = string.format("Collision CV: %.2fV, Trigger: 5V", collision_cv)
-                    verbose_timer = verbose_duration
-                    collision_trigger_timer = trigger_duration -- Activate collision trigger
-
-                    -- Update collision times
-                    p1.last_collision_time = current_time
-                    p2.last_collision_time = current_time
+                            -- Update collision times
+                            p1.last_collision_time = current_time
+                            p2.last_collision_time = current_time
+                        end
+                    end
                 end
             end
         end
@@ -189,16 +258,22 @@ end
 
 -- Draw particles and dust on the screen
 local function draw_elements()
-    -- Draw particles as smooth boxes
-    for _, p in ipairs(particles) do
-        local brightness = math.floor(p.radius * 1.5) -- Brightness based on size
-        drawSmoothBox(p.x, p.y, p.x + p.radius, p.y + p.radius, brightness)
+    -- Draw active particles as smooth boxes
+    for i = 1, MAX_PARTICLES do
+        local p = particles[i]
+        if p.active then
+            local brightness = math.floor(p.radius * 1.5) -- Brightness based on size
+            drawSmoothBox(p.x, p.y, p.x + p.radius, p.y + p.radius, brightness)
+        end
     end
 
-    -- Draw dust as small points using drawLine
-    for _, d in ipairs(dust) do
-        drawLine(math.floor(d.x), math.floor(d.y), math.floor(d.x),
-        math.floor(d.y), d.brightness)
+    -- Draw active dust as small points using drawLine
+    for i = 1, MAX_DUST do
+        local d = dust[i]
+        if d.active then
+            drawLine(math.floor(d.x), math.floor(d.y), math.floor(d.x),
+                    math.floor(d.y), d.brightness)
+        end
     end
 
     -- Display verbose message if timer is active and verbose mode is enabled
@@ -213,6 +288,16 @@ return {
     author = "Romain Faure",
 
     init = function(self)
+        -- Reset all particles and dust to inactive on init
+        for i = 1, MAX_PARTICLES do
+            particle_pool[i].active = false
+        end
+        for i = 1, MAX_DUST do
+            dust_pool[i].active = false
+        end
+        active_particles = 0
+        active_dust = 0
+
         return {
             inputs = 1,
             outputs = 4,
@@ -233,8 +318,6 @@ return {
         root_note = self.parameters[1]
         octave = self.parameters[2]
         -- Convert numeric scale selection to scale name
-        local scale_names = {"minor", "major", "dorian", "phrygian", "lydian", "mixolydian", 
-                            "locrian", "harmonic_minor", "melodic_minor"}
         selected_scale = scale_names[self.parameters[3]] or "minor"
         global_fall_speed = self.parameters[4]
         gravity = self.parameters[5]
@@ -264,14 +347,11 @@ return {
         local particle_trigger_value = trigger_timer > 0 and 5 or 0
         local collision_trigger_value = collision_trigger_timer > 0 and 5 or 0
 
-        if #particles > 0 then
-            -- Calculate the actual MIDI note using the scale degree
-            local midi_note = scale_to_midi(particles[1].pitch, selected_scale, root_note, octave)
-            local pitch_voltage = note_to_voltage(midi_note)
-            return {pitch_voltage, particle_trigger_value, collision_cv, collision_trigger_value}
-        else
-            return {0, particle_trigger_value, collision_cv, collision_trigger_value}
-        end
+        output_table[1] = last_ground_pitch_voltage
+        output_table[2] = particle_trigger_value
+        output_table[3] = collision_cv
+        output_table[4] = collision_trigger_value
+        return output_table
     end,
 
     draw = function(self)
